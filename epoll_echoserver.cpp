@@ -5,46 +5,52 @@
 #include <cstring>
 #include <iostream>
 #include <vector>
-#include <thread>
 #include <fcntl.h>
+#include <errno.h>
 
 #define DEFAULT_BUFLEN 2560
 #define DEFAULT_PORT 9000
-#define DEFAULT_IP "127.0.0.1"
-#define MAX_EVENTS 10
+#define MAX_EVENTS 1024
 
 std::string HttpResponseContent = "HTTP/1.2 200 OK\r\nContent-Length:2\r\nContent-Type: text/html\r\n\r\nHi";
 
-// 设置非阻塞模式
+// 設置非阻塞模式
 void setNonBlocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-// 工作线程处理 I/O
-void workerThread_RecvAndSend(int epollFd) {
-    struct epoll_event events[MAX_EVENTS];
+// 處理接收與發送邏輯
+void handleClient(int clientFd, epoll_event& event, int epollFd) {
     char buffer[DEFAULT_BUFLEN];
-
     while (true) {
-        int eventCount = epoll_wait(epollFd, events, MAX_EVENTS, -1);
-        for (int i = 0; i < eventCount; ++i) {
-            int clientFd = events[i].data.fd;
+        memset(buffer, 0, sizeof(buffer));
+        int bytesReceived = recv(clientFd, buffer, sizeof(buffer), 0);
 
-            if (events[i].events & EPOLLIN) {
-                // 接收資料
-                memset(buffer, 0, DEFAULT_BUFLEN);
-                int bytesReceived = recv(clientFd, buffer, DEFAULT_BUFLEN, 0);
-                if (bytesReceived <= 0) {
-                    close(clientFd);
-                    epoll_ctl(epollFd, EPOLL_CTL_DEL, clientFd, nullptr);
-                    std::cout << "Connection closed by client\n";
-                } else {
-                    std::cout << "Received: " << buffer << std::endl;
-
-                    // 回傳資料
-                    send(clientFd, buffer, bytesReceived, 0);
-                }
+        if (bytesReceived == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // 資料暫時讀完
+                break;
+            }
+            perror("recv failed");
+            close(clientFd);
+            epoll_ctl(epollFd, EPOLL_CTL_DEL, clientFd, nullptr);
+            return;
+        } else if (bytesReceived == 0) {
+            // 客戶端關閉連線
+            std::cout << "Client disconnected\n";
+            close(clientFd);
+            epoll_ctl(epollFd, EPOLL_CTL_DEL, clientFd, nullptr);
+            return;
+        } else {
+            // 回傳資料
+            std::cout << "Received: " << buffer << std::endl;
+            int bytesSent = send(clientFd, buffer, bytesReceived, 0);
+            if (bytesSent == -1) {
+                perror("send failed");
+                close(clientFd);
+                epoll_ctl(epollFd, EPOLL_CTL_DEL, clientFd, nullptr);
+                return;
             }
         }
     }
@@ -57,10 +63,14 @@ int main() {
         return 1;
     }
 
-    
+ 
     setNonBlocking(serverFd);
 
-    // 進行address binding
+
+    int opt = 1;
+    setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+
     struct sockaddr_in serverAddr{};
     serverAddr.sin_family = AF_INET;
     serverAddr.sin_port = htons(DEFAULT_PORT);
@@ -78,7 +88,7 @@ int main() {
         return 1;
     }
 
-    // 创建 epoll 实例
+    // 創建 epoll 實例
     int epollFd = epoll_create1(0);
     if (epollFd == -1) {
         perror("Epoll creation failed");
@@ -86,7 +96,8 @@ int main() {
         return 1;
     }
 
-    struct epoll_event ev{};
+    // 添加 server socket 到 epoll
+    struct epoll_event ev{}, events[MAX_EVENTS];
     ev.events = EPOLLIN;
     ev.data.fd = serverFd;
 
@@ -97,35 +108,48 @@ int main() {
         return 1;
     }
 
-    // 創建worker thread
-    std::vector<std::thread> workers;
-    for (int i = 0; i < 2; ++i) {
-        workers.emplace_back(workerThread_RecvAndSend, epollFd);
-    }
+    std::cout << "Server is running on port " << DEFAULT_PORT << "\n";
 
-    // 主執行緒作為新的client接收端,迴圈中止條件待定
     while (true) {
-        struct sockaddr_in clientAddr{};
-        socklen_t clientLen = sizeof(clientAddr);
-        int clientFd = accept(serverFd, (struct sockaddr*)&clientAddr, &clientLen);
-
-        if (clientFd != -1) {
-            setNonBlocking(clientFd);
-            ev.events = EPOLLIN | EPOLLET;
-            ev.data.fd = clientFd;
-            if (epoll_ctl(epollFd, EPOLL_CTL_ADD, clientFd, &ev) == -1) {
-                perror("Epoll ctl add client failed");
-                close(clientFd);
-            } else {
-                std::cout << "New connection accepted\n";
-            }
+        int eventCount = epoll_wait(epollFd, events, MAX_EVENTS, -1);
+        if (eventCount == -1) {
+            perror("Epoll wait failed");
+            break;
         }
-    }
 
+        for (int i = 0; i < eventCount; ++i) {
+            int fd = events[i].data.fd;
 
-    for (auto& worker : workers) {
-        if (worker.joinable()) {
-            worker.join();
+            if (fd == serverFd) {
+                // 接受新連線
+                while (true) {
+                    struct sockaddr_in clientAddr{};
+                    socklen_t clientLen = sizeof(clientAddr);
+                    int clientFd = accept(serverFd, (struct sockaddr*)&clientAddr, &clientLen);
+
+                    if (clientFd == -1) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            // 所有連線都已接受
+                            break;
+                        }
+                        perror("Accept failed");
+                        continue;
+                    }
+
+                    std::cout << "New client connected: FD " << clientFd << "\n";
+                    setNonBlocking(clientFd);
+
+                    ev.events = EPOLLIN | EPOLLET;
+                    ev.data.fd = clientFd;
+                    if (epoll_ctl(epollFd, EPOLL_CTL_ADD, clientFd, &ev) == -1) {
+                        perror("Epoll ctl add client failed");
+                        close(clientFd);
+                    }
+                }
+            } else {
+                // 處理現有客戶端 I/O
+                handleClient(fd, events[i], epollFd);
+            }
         }
     }
 
